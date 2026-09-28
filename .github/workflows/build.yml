@@ -1,0 +1,265 @@
+# Cloud build for GoRhanHee/kernel_samsung_sm8250
+# Galaxy S20 / S20+ / S20 Ultra  (Snapdragon 865, kona / sm8250)
+#
+# The tree cannot be built as-is, because two things it depends on are not in it:
+#
+#   1. toolchain/
+#      build.sh sets
+#        CROSS_COMPILE=<repo>/toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-
+#        CLANG=<repo>/toolchain/llvm-arm-toolchain-ship/10.0/bin/clang
+#      and the top-level Makefile hardcodes
+#        REAL_CC = $(srctree)/toolchain/llvm-arm-toolchain-ship/10.0/bin/clang
+#
+#      "llvm-arm-toolchain-ship" is Qualcomm's proprietary Snapdragon LLVM, NOT
+#      AOSP clang, and it is not downloadable without a Qualcomm account. That is
+#      why substituting a distro clang cannot work: every compile goes through
+#      scripts/gcc-wrapper.py, whose warning allow-list is only three lines, so a
+#      different clang trips it and aborts the build. The kernel author publishes
+#      the exact pair he built against in a separate repository - that is what we
+#      fetch here.
+#
+#   2. KernelSU-Next/
+#      The tree carries a gitlink for it but ships no .gitmodules, so no clone
+#      can ever fetch it. drivers/kernelsu is a symlink to
+#      ../KernelSU-Next/kernel, so the checkout has to sit at the repo root
+#      (a copy under drivers/kernelsu/ would NOT be used). Pinned to the commit
+#      this kernel was actually developed against - the kernel's last commit,
+#      "Fix avc.c file", lands one day after it.
+#
+name: Build SM8250 Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: Which model to build
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - G981N
+          - G986N
+          - G988N
+  push:
+    branches:
+      - x1q
+    paths:
+      - .github/workflows/build.yml
+      - build.sh
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TOOLCHAIN_URL: https://github.com/GoRhanHee/aarch64-android-4.9_llvm-10.0.git
+  TOOLCHAIN_BRANCH: toolchain
+  KSU_URL: https://github.com/KernelSU-Next/KernelSU-Next.git
+  KSU_COMMIT: effdc4fc06820afde70dd1b5e94658304efdb2ab
+
+jobs:
+  prepare:
+    name: Resolve targets
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        run: |
+          x1q='{"model":"G981N","device":"x1q"}'
+          y2q='{"model":"G986N","device":"y2q"}'
+          z3q='{"model":"G988N","device":"z3q"}'
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.model }}" != "all" ]; then
+            case "${{ inputs.model }}" in
+              G981N) picked="$x1q" ;;
+              G986N) picked="$y2q" ;;
+              G988N) picked="$z3q" ;;
+            esac
+            echo "matrix={\"include\":[$picked]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$x1q,$y2q,$z3q]}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.model }} (${{ matrix.device }})
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /usr/local/share/boost \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL
+          sudo apt-get clean
+          df -h /
+
+      - name: Add swap
+        run: |
+          # build.sh hardcodes -j16, but a hosted runner only has 4 vCPU / 16 GB.
+          # Swap keeps the parallel clang jobs from OOM-killing each other.
+          sudo swapoff -a || true
+          sudo rm -f /swapfile
+          sudo fallocate -l 8G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=8192
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Check out kernel source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install build dependencies
+        run: |
+          # No aarch64 cross compiler is installed on purpose: the toolchain
+          # fetched below provides its own. Pulling in the distro one is exactly
+          # what makes other attempts fail.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential cpio zip unzip tar xz-utils \
+            python3 python-is-python3
+
+          # scripts/gcc-wrapper.py is run as `python <script> <real cc>` - the
+          # Makefile sets CC = $(PYTHON) .../gcc-wrapper.py $(REAL_CC) with
+          # PYTHON = python. Its shebang still says python2, but Ubuntu 22.04
+          # ships no bare `python` at all, while the script body handles both
+          # versions. python-is-python3 is therefore sufficient; the shebang is
+          # never consulted on this path.
+          python --version
+
+      - name: Fetch toolchain
+        run: |
+          git clone --depth=1 --branch "${TOOLCHAIN_BRANCH}" "${TOOLCHAIN_URL}" toolchain
+          du -sh toolchain
+
+      - name: Fetch KernelSU-Next at the pinned commit
+        run: |
+          git init KernelSU-Next
+          git -C KernelSU-Next remote add origin "${KSU_URL}"
+          git -C KernelSU-Next fetch --depth=1 origin "${KSU_COMMIT}"
+          git -C KernelSU-Next checkout --detach FETCH_HEAD
+          git -C KernelSU-Next log -1 --oneline
+
+      - name: Verify prerequisites
+        env:
+          DEVICE: ${{ matrix.device }}
+        run: |
+          fail=0
+          check() {
+            if [ -e "$1" ]; then
+              echo "  ok      $1"
+            else
+              echo "::error::missing $1"
+              fail=1
+            fi
+          }
+
+          echo "checking toolchain and KernelSU layout"
+          check "toolchain/llvm-arm-toolchain-ship/10.0/bin/clang"
+          check "toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-gcc"
+          check "KernelSU-Next/kernel/Kconfig"
+          check "arch/arm64/configs/vendor/${DEVICE}_kor_singlex_defconfig"
+          check "AIK_${DEVICE}/repackimg.sh"
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::group::toolchain layout"
+            find toolchain -maxdepth 4 -type d | head -40
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # drivers/kernelsu -> ../KernelSU-Next/kernel must now resolve
+          echo "drivers/kernelsu resolves to:"
+          ls -la drivers/kernelsu | head -5
+
+      - name: Fix file permissions
+        env:
+          DEVICE: ${{ matrix.device }}
+        run: |
+          chmod +x build.sh
+          chmod +x tools/dtc 2>/dev/null || true
+          find "AIK_${DEVICE}" -name '*.sh' -exec chmod +x {} \;
+          find "AIK_${DEVICE}/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+      - name: Build
+        env:
+          DEVICE: ${{ matrix.device }}
+        run: bash build.sh ${{ matrix.model }}
+
+      - name: Verify artifacts
+        env:
+          DEVICE: ${{ matrix.device }}
+        run: |
+          tar_file="gorhanhee/${DEVICE}_SuSFS.tar"
+
+          if [ ! -f "$tar_file" ]; then
+            echo "::error::$tar_file was not produced"
+            echo "::group::gorhanhee/"
+            ls -la gorhanhee/ 2>/dev/null || echo "(no gorhanhee directory)"
+            echo "::endgroup::"
+            echo "::group::out/arch/arm64/boot"
+            ls -la out/arch/arm64/boot/ 2>/dev/null || echo "(no boot directory)"
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          # build.sh copies the kernel image into the AIK split_img without
+          # checking the copy and without `set -e`. If the produced image is not
+          # named Image-dtb the cp fails, the script carries on, and repackimg.sh
+          # packs the stock kernel that was already sitting in
+          # AIK_<device>/split_img - yielding a boot.img that looks perfectly
+          # valid but boots the old kernel. Assert the copy really happened.
+          image="out/arch/arm64/boot/Image-dtb"
+          if [ ! -f "$image" ]; then
+            echo "::error::$image was not produced"
+            echo "::group::out/arch/arm64/boot"
+            ls -la out/arch/arm64/boot/ 2>/dev/null || echo "(missing)"
+            echo "::endgroup::"
+            exit 1
+          fi
+
+          if ! cmp -s "$image" "AIK_${DEVICE}/split_img/boot.img-kernel"; then
+            echo "::error::AIK_${DEVICE}/split_img/boot.img-kernel differs from the built image - the repack used the wrong kernel"
+            ls -la "$image" "AIK_${DEVICE}/split_img/boot.img-kernel"
+            exit 1
+          fi
+          echo "repacked kernel matches the built image ($(du -h "$image" | cut -f1))"
+
+          ls -la gorhanhee/
+          echo "::group::archive contents"
+          tar -tvf "$tar_file"
+          echo "::endgroup::"
+
+          echo "::group::KernelSU / SuSFS symbols in out/.config"
+          grep -E '^CONFIG_(KSU|SUSFS)' out/.config || echo "(none found)"
+          echo "::endgroup::"
+
+          if ! grep -q '^CONFIG_KSU=y' out/.config; then
+            echo "::warning::CONFIG_KSU is not enabled - this build has no KernelSU"
+          fi
+
+          # keep the config next to the images so the artifacts are self-describing
+          cp out/.config "gorhanhee/${DEVICE}_kernel_config.txt"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.model }}-${{ matrix.device }}-SuSFS
+          path: gorhanhee/
+          if-no-files-found: error
+          retention-days: 30
