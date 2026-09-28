@@ -41,6 +41,19 @@ on:
           - G981N
           - G986N
           - G988N
+      ksu_ref:
+        description: 'KernelSU-Next revision: tag, branch or commit. Leave empty for the commit this kernel was written against.'
+        required: false
+        default: ""
+        type: string
+      disable_encryption:
+        description: 'Patch the ramdisk fstab so /data is no longer force-encrypted'
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
     branches:
       - x1q
@@ -134,6 +147,27 @@ jobs:
             build-essential cpio zip unzip tar xz-utils \
             python3 python-is-python3
 
+          # Qualcomm's Snapdragon clang 10 is an old binary: it links against
+          # libtinfo.so.5 / libncurses.so.5, and Ubuntu 22.04 only ships the
+          # .so.6 versions. Without them the compiler cannot start at all
+          # ("error while loading shared libraries: libtinfo.so.5"), which is
+          # what the first run of this workflow hit. Prefer the real packages,
+          # fall back to a symlink - terminfo's ABI is compatible for the
+          # symbols clang actually uses.
+          sudo apt-get install -y --no-install-recommends libtinfo5 libncurses5 || true
+          for lib in tinfo ncurses; do
+            if ! ldconfig -p | grep -q "lib${lib}\.so\.5"; then
+              src=$(ldconfig -p | awk -v pat="lib${lib}.so.6 " 'index($0, pat) { print $NF; exit }')
+              if [ -n "$src" ]; then
+                sudo ln -sf "$src" "/usr/lib/x86_64-linux-gnu/lib${lib}.so.5"
+                echo "symlinked $src -> lib${lib}.so.5"
+              else
+                echo "::warning::could not locate lib${lib}.so.6 to symlink"
+              fi
+            fi
+          done
+          sudo ldconfig
+
           # scripts/gcc-wrapper.py is run as `python <script> <real cc>` - the
           # Makefile sets CC = $(PYTHON) .../gcc-wrapper.py $(REAL_CC) with
           # PYTHON = python. Its shebang still says python2, but Ubuntu 22.04
@@ -147,13 +181,61 @@ jobs:
           git clone --depth=1 --branch "${TOOLCHAIN_BRANCH}" "${TOOLCHAIN_URL}" toolchain
           du -sh toolchain
 
-      - name: Fetch KernelSU-Next at the pinned commit
+      - name: Verify the toolchain actually runs
         run: |
+          clang="toolchain/llvm-arm-toolchain-ship/10.0/bin/clang"
+          gcc="toolchain/gcc/linux-x86/aarch64/aarch64-linux-android-4.9/bin/aarch64-linux-android-gcc"
+
+          echo "dynamic dependencies of Qualcomm's clang:"
+          ldd "$clang" | sed 's/^/  /'
+
+          if ldd "$clang" | grep -q 'not found'; then
+            echo "::error::the toolchain clang cannot start - unresolved shared libraries are listed above"
+            exit 1
+          fi
+
+          echo
+          echo "clang: $("$clang" --version | head -n 1)"
+          echo "gcc:   $("$gcc" --version | head -n 1)"
+
+          # These are the very probes init/Kconfig runs through $(shell,...) and
+          # $(success,...). Their output is expanded straight into the Kconfig
+          # text, so anything multi-line or quoted coming out of them derails the
+          # parser and surfaces as "syntax error" a couple of lines further down
+          # instead of pointing here.
+          echo
+          echo "Kconfig compiler probes:"
+          echo "--- scripts/gcc-version.sh ---"
+          sh scripts/gcc-version.sh -p "$PWD/$clang" 2>&1 | head -n 3
+          echo "--- scripts/clang-version.sh ---"
+          sh scripts/clang-version.sh "$PWD/$clang" 2>&1 | head -n 3
+          echo "--- through gcc-wrapper.py, i.e. how CC is really invoked ---"
+          python scripts/gcc-wrapper.py "$PWD/$clang" --version 2>&1 | head -n 3
+
+      - name: Fetch KernelSU-Next
+        run: |
+          # Which revision to use. Empty means "whatever the repository's gitlink
+          # pins", which is the commit this kernel was written against - its last
+          # commit, "Fix avc.c file", is dated one day after that KernelSU-Next
+          # commit, so the two were clearly developed together.
+          #
+          # A newer upstream revision can be requested from the dispatch form
+          # (e.g. v3.4.0, or main). KernelSU-Next's kernel-side code changes
+          # between releases, and this kernel tree is from 2025-08, so a newer
+          # revision may or may not compile against it. The build log says which
+          # one was used, so a failure is easy to attribute.
+          ref="${{ inputs.ksu_ref }}"
+          if [ -z "$ref" ]; then
+            ref="${KSU_COMMIT}"
+          fi
+          echo "KernelSU-Next revision: $ref"
+          echo "KSU_RESOLVED_REF=$ref" >> "$GITHUB_ENV"
+
           git init KernelSU-Next
           git -C KernelSU-Next remote add origin "${KSU_URL}"
-          git -C KernelSU-Next fetch --depth=1 origin "${KSU_COMMIT}"
+          git -C KernelSU-Next fetch --depth=1 origin "$ref"
           git -C KernelSU-Next checkout --detach FETCH_HEAD
-          git -C KernelSU-Next log -1 --oneline
+          git -C KernelSU-Next log -1 --format='%H %ad %s' --date=short
 
       - name: Verify prerequisites
         env:
@@ -195,6 +277,43 @@ jobs:
           chmod +x tools/dtc 2>/dev/null || true
           find "AIK_${DEVICE}" -name '*.sh' -exec chmod +x {} \;
           find "AIK_${DEVICE}/bin" -type f -exec chmod +x {} \; 2>/dev/null || true
+
+      - name: Disable forced encryption in the ramdisk
+        if: inputs.disable_encryption == 'true'
+        env:
+          DEVICE: ${{ matrix.device }}
+        run: |
+          fstab="AIK_${DEVICE}/ramdisk/fstab.qcom"
+
+          if [ ! -f "$fstab" ]; then
+            echo "::error::$fstab not found, cannot patch encryption"
+            exit 1
+          fi
+
+          echo "before:"
+          grep -n 'by-name/userdata' "$fstab" || true
+
+          # Only the /data line is touched. The very same fileencryption=ice flag
+          # also sits on /keydata and /keyrefuge, which are Samsung ODE
+          # partitions backing Knox. Clearing those breaks Knox and can stop the
+          # device from booting, so they are deliberately left alone. Anchoring
+          # the substitution on "by-name/userdata" achieves that.
+          #
+          # The edit reaches the final image: build.sh runs repackimg.sh with no
+          # arguments, and that script rebuilds the ramdisk from this directory
+          # unless --original is passed.
+          sed -i -e 's|\(by-name/userdata.*\)fileencryption=|\1encryptable=|' \
+                 -e 's|\(by-name/userdata.*\)forceencrypt|\1encryptable=ice|' "$fstab"
+
+          echo "after:"
+          grep -n 'by-name/userdata' "$fstab" || true
+
+          if ! grep 'by-name/userdata' "$fstab" | grep -q 'encryptable='; then
+            echo "::error::the /data entry still has no encryptable= flag - nothing was changed"
+            exit 1
+          fi
+
+          echo "::warning::/data is no longer force-encrypted. This only takes effect after a factory reset, and it wipes existing user data."
 
       - name: Build
         env:
@@ -245,6 +364,8 @@ jobs:
           tar -tvf "$tar_file"
           echo "::endgroup::"
 
+          echo "KernelSU-Next revision used: ${KSU_RESOLVED_REF:-<default>}"
+
           echo "::group::KernelSU / SuSFS symbols in out/.config"
           grep -E '^CONFIG_(KSU|SUSFS)' out/.config || echo "(none found)"
           echo "::endgroup::"
@@ -253,8 +374,16 @@ jobs:
             echo "::warning::CONFIG_KSU is not enabled - this build has no KernelSU"
           fi
 
-          # keep the config next to the images so the artifacts are self-describing
+          # keep the config and the revision next to the images, so an artifact
+          # is self-describing now that the KernelSU-Next revision is selectable
           cp out/.config "gorhanhee/${DEVICE}_kernel_config.txt"
+          {
+            echo "device:              ${DEVICE} (${{ matrix.model }})"
+            echo "kernel commit:       $(git rev-parse HEAD)"
+            echo "KernelSU-Next ref:   ${KSU_RESOLVED_REF:-<default>}"
+            echo "KernelSU-Next commit: $(git -C KernelSU-Next rev-parse HEAD)"
+            echo "toolchain:           $(toolchain/llvm-arm-toolchain-ship/10.0/bin/clang --version | head -1)"
+          } > "gorhanhee/${DEVICE}_build_info.txt"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -263,3 +392,4 @@ jobs:
           path: gorhanhee/
           if-no-files-found: error
           retention-days: 30
+
